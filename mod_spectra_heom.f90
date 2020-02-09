@@ -1,5 +1,4 @@
 Module mod_spectra_heom
-!use matmul_lapack
 !! Reproducing figure 5 of Strumpfer Schulten, JCTC 8, 2808 (2012)
 !! Chen, Zheng, Shi, Tan, JCP 131, 094502 (2009)
 implicit none
@@ -23,22 +22,19 @@ complex*16,allocatable :: c_matsubara(:),omg_matsubara(:)
 real*8 tolerance
 real*8 sum_c_over_nu
 
-!! Making changes to test git
-
 !! Output
 complex*16,allocatable :: dip_mom_corr(:)
 
 !! System specific
 integer nquant
-real*8 gamma,eta,temperature
+real*8 gamma,eta,temperature,lambda
 complex*16,allocatable :: Hamil_e(:,:),dip_moment(:,:)
+real*8,allocatable :: Q_op(:,:,:)
 
 !! Evolution
-integer nsteps
+integer nsteps,nsteps_filter
 real*8 dt,tim_tot,curr_time
-
-!! Misc
-real*8 tim_ind
+integer flag_scale,flag_truncate,flag_spectra
 
 contains
 !---------------------------------------------------------- 
@@ -47,6 +43,8 @@ contains
 subroutine setup
   implicit none
   character st_ch
+  integer i
+  real*8,allocatable:: Ham_site(:,:),dip_real(:,:)
 
   pi=dacos(-1.d0)
   open(10,file="spectra_heom.inp")
@@ -56,6 +54,32 @@ subroutine setup
   read(10,*) tolerance
   read(10,*) dt
   read(10,*) tim_tot
+  read(10,*) nsteps_filter
+  read(10,*) flag_scale
+  read(10,*) flag_truncate
+  read(10,*) flag_spectra
+  read(10,*) gamma
+  read(10,*) lambda
+  read(10,*) temperature
+  allocate(Hamil_e(nquant,nquant),Ham_site(nquant,nquant))
+  read(10,*)
+  read(10,*)
+  do i=1,nquant
+    read(10,*) Ham_site(i,:)
+  enddo
+  allocate(Q_op(nquant,nquant,nquant))
+  read(10,*)
+  read(10,*)
+  do i=1,nquant
+    read(10,*) Q_op(:,:,i)
+    read(10,*)
+  enddo
+  allocate(dip_moment(nquant,nquant),dip_real(nquant,nquant))
+  if(flaG_spectra==1) then
+    read(10,*)
+    read(10,*)dip_real
+    dip_moment=dip_real
+  endif
   read(10,*) st_ch
   close(10)
   !----------------------------------------------------------
@@ -64,23 +88,41 @@ subroutine setup
     write(6,*) "problem in reading input file"
     stop
   endif
+  
+  if(flag_scale.ne.0.and.flag_scale.ne.1) then
+    write(6,*) "flag_scale should be either 1 or 0. terminating ..."
+    stop
+  endif
 
+  if(flag_truncate.ne.0.and.flag_truncate.ne.1) then
+    write(6,*) "flag_truncate should be either 1 or 0. terminating ..."
+    stop
+  endif
+
+  if(flag_spectra.ne.0.and.flag_spectra.ne.1) then
+    write(6,*) "flag_spectra should be either 1 or 0. terminating ..."
+    stop
+  endif
   !---------------------------------------------------------- 
 
-  dt=dt/au2s
-  tim_tot=tim_tot/au2s
+!  dt=dt/au2s
+!  tim_tot=tim_tot/au2s
+!  gamma=1.d15/gamma*au2s
+!  eta=2*lambda/hbar*wave_to_J/au2J
+  eta=2*lambda/hbar
+!  temperature=temperature*1.38064852d-23/au2J
+  Hamil_e=Ham_site
 
   !nn_tot=(factorial(LL+nquant*KK)/factorial(LL))/factorial(nquant*KK)
   call compute_nn_tot
-write(6,*) nn_tot
+  write(6,*) "total number of auxillary density matrices = ",nn_tot
   nsteps=nint(tim_tot/dt)
 
-  allocate(dip_mom_corr(nsteps),dip_moment(nquant,nquant))
+  allocate(dip_mom_corr(nsteps))
   allocate(nn(nquant,0:KK,nn_tot),map_nplus(nquant,0:KK,nn_tot),map_nneg(nquant,0:KK,nn_tot))
   allocate(map_sum(0:LL),zero(nn_tot))
   allocate(rho(nquant,nquant,nn_tot),rho_t0(nquant,nquant))
   allocate(c_matsubara(0:KK),omg_matsubara(0:KK))
-  allocate(Hamil_e(nquant,nquant))
 
   call compute_nn
   call compute_map
@@ -97,19 +139,19 @@ subroutine main
   call cpu_time(t1)
 
   open(100,file="rho.out")
-  !open(101,file="spectra.out")
+  if(flag_spectra==1)open(101,file="abs_spectra.out")
   call setup_parameters
   call init_cond
   call evolve(nsteps)
-  !call fft_dip_mom_corr
+  if(flag_spectra==1)call fft_dip_mom_corr
 
   call system_clock ( clck_counts_end, clck_rate )
   call cpu_time(t2)
-  write(6,*) "total time=",(clck_counts_end - clck_counts_beg) / real(clck_rate),t2-t1
-  write(6,*) "tim_index=",tim_ind
+  write(6,*) "total wall clock time=",(clck_counts_end - clck_counts_beg) / real(clck_rate)
+  write(6,*) "total cpu time=",t2-t1
 
   close(100)
-  !close(101)
+  if(flag_spectra==1)close(101)
 
 end subroutine main
 !---------------------------------------------------------- 
@@ -117,41 +159,37 @@ end subroutine main
 subroutine setup_parameters
   implicit none
   integer i,j,k
-  real*8 tmp,omg,cc
+  real*8 tmp,omg,cc,eps
 
   !JJ=1.0!*wave_to_J
-  gamma=1.d0/0.1d-12*au2s
-  eta=2*50.d0/hbar*wave_to_J/au2J
-  temperature=300.d0*1.38064852d-23/au2J
-
   omg_matsubara(0)=gamma 
   c_matsubara(0)=eta*gamma/2.d0* (1.d0/tan(hbar*gamma/(2.d0*kb*temperature))-iota)
   do k=1,KK
     omg_matsubara(k)=2*k*pi*kb*temperature/hbar
     c_matsubara(k)=2*eta*gamma*kb*temperature/hbar * omg_matsubara(k)/(omg_matsubara(k)**2-gamma**2)
-    !c_matsubara(k)=4*(k-1)*pi*eta*gamma/((2*(k-1)*pi)**2-(hbar*gamma/(kb*temperature))**2)
   enddo
 
   sum_c_over_nu=0.d0
-  do k=KK+1,200
+  do k=KK+1,KK+200
     omg=2*k*pi*kb*temperature/hbar
     cc=2*eta*gamma*kb*temperature/hbar * omg/(omg**2-gamma**2)
     sum_c_over_nu=sum_c_over_nu+cc/omg
   enddo
+  !write(6,*) sum_c_over_nu,eta*kb*temperature/gamma-real(sum(c_matsubara/omg_matsubara))
+  !stop
 
-!write(6,*) eta*kb*temperature/gamma-sum(c_matsubara/omg_matsubara),sum_c_over_nu
-!stop
-
-  dip_moment=0.d0
-  do i=2,nquant
-    dip_moment(1,i)=1.d0
-    dip_moment(i,1)=1.d0
+  eps=0.d0
+  do i=1,nquant
+    eps=eps+Hamil_e(i,i)
+  enddo
+  eps=eps/real(nquant)
+  do i=1,nquant
+    Hamil_e(i,i)=Hamil_e(i,i)-eps
   enddo
 
-  Hamil_e=0.d0
-  Hamil_e(1,1)=50.d0;Hamil_e(1,2)=200.d0
-  Hamil_e(2,1)=200.d0;Hamil_e(2,2)=-50.d0
-  Hamil_e=Hamil_e*wave_to_J/au2J
+  zero=0
+
+!  Hamil_e=Hamil_e*wave_to_J/au2J
 
 write(6,*) "Parameters Set ..."
 
@@ -162,16 +200,15 @@ subroutine init_cond
   implicit none
   integer i
 
-  rho=0.d0 !! XXX !!
+  rho=0.d0
   rho(1,1,1)=1.d0
-!  rho(:,:,1)=matmul_lap(dip_moment,rho(:,:,1))
+
+  if(flag_spectra==1) rho(:,:,1)=matmul(dip_moment,rho(:,:,1))
 
   rho_t0=rho(:,:,1)
 
   curr_time=0.d0
   dip_mom_corr=0.d0
-
-  tim_ind=0.d0
 
 write(6,*) "Intitial Conditions set ... "
 
@@ -184,9 +221,9 @@ subroutine evolve(nsteps)
   integer i
 
   do i=1,nsteps
-    call compute_dip_mom_corr(i)
+    if(flag_spectra==1)call compute_dip_mom_corr(i)
     call write_output(i)
-    if(mod(i,10)==1)call filter
+    if(mod(i,nsteps_filter)==0)call filter
     call rk4(rho,dt)
     curr_time=curr_time+dt
   enddo
@@ -199,9 +236,9 @@ subroutine write_output(i)
   integer,intent(in):: i
   integer j
 
-  write(100,'(f15.7$)') curr_time*au2s*1.d15
+  if(flag_spectra==0)write(100,'(f15.7$)') curr_time
   do j=1,nquant
-    write(100,'(f15.7$)')real(rho(j,j,1))
+    if(flag_spectra==0)write(100,'(f15.7$)')real(rho(j,j,1))
   enddo
   write(100,*)
 
@@ -229,11 +266,6 @@ subroutine rk4(rho,dt)
   real*8,intent(in)::dt
   complex*16,dimension(nquant,nquant,nn_tot) :: k1,k2,k3,k4
 
-!write(6,*) "In RK4 ..."
-
-  !call compute_deriv(rho,k1)
-  !rho=rho+dt*k1
-
   call compute_deriv(rho,k1)
   call compute_deriv(rho+0.5*dt*k1,k2)
   call compute_deriv(rho+0.5*dt*k2,k3)
@@ -252,11 +284,9 @@ subroutine compute_deriv(rho,drho_dt)
   integer n
   integer tid,OMP_GET_THREAD_NUM
 
-!  call omp_set_num_threads(10)
+!  call omp_set_num_threads(4)
 
   !$OMP PARALLEL DEFAULT(SHARED) PRIVATE(TID,tmp)
-!  TID = OMP_GET_THREAD_NUM()
-!  PRINT *, 'Hello World from thread = ', TID
   !$OMP DO SCHEDULE(STATIC)
   do n=1,nn_tot
     call compute_deriv_n(n,rho,tmp)
@@ -271,10 +301,11 @@ end subroutine compute_deriv
 subroutine compute_deriv_n(n,rho,drho_dt)
   !! implicit none
   !! Eq. 15, JCP 131, 094502 (2009)
+  !! Scaled HEOM approach from JCP 130, 084105 (2009)
   integer,intent(in) :: n
   complex*16,intent(in)::rho(nquant,nquant,nn_tot)
   complex*16,intent(out)::drho_dt(nquant,nquant)
-  complex*16 tmp(nquant,nquant),mat_tmp(nquant,nquant),mat_tmp2(nquant,nquant)
+  complex*16 tmp(nquant,nquant),mat_tmp(nquant,nquant)
   integer m,k,nplus,nminus
   integer nvec(nquant,0:KK)!,nvec_plus(nquant,KK),nvec_neg(nquant,KK)
 
@@ -284,49 +315,52 @@ subroutine compute_deriv_n(n,rho,drho_dt)
 
     if(zero(n)==0) then !! matrix at n is not filtered out
 
-!if(n==2) write(6,*) "1st pass"
-
       do m=1,nquant
         do k=0,KK
           tmp=tmp-nvec(m,k)*omg_matsubara(k)*rho(:,:,n)
         enddo
       enddo
 
-      do m=1,nquant
-        mat_tmp=0.d0;mat_tmp(m,m)=1.d0 !! matrix |m><m|
-        tmp=tmp-(eta*kb*temperature/gamma-real(sum(c_matsubara/omg_matsubara)))*commute(mat_tmp,commute(mat_tmp,rho(:,:,n)))
-        !tmp=tmp-(sum_c_over_nu)*commute(mat_tmp,commute(mat_tmp,rho(:,:,n)))
-      enddo
+      !! Ihizaki-Tanimura scheme for truncation
+      !! JPSJ 74 3131, 2005
+      if(flag_truncate==1) then
+        do m=1,nquant
+          !mat_tmp=0.d0;mat_tmp(m,m)=1.d0 !! matrix |m><m|
+          mat_tmp=Q_op(:,:,m)
+          !tmp=tmp-(eta*kb*temperature/gamma-real(sum(c_matsubara/omg_matsubara)))*commute(mat_tmp,commute(mat_tmp,rho(:,:,n)))
+          tmp=tmp-sum_c_over_nu*commute(mat_tmp,commute(mat_tmp,rho(:,:,n)))
+        enddo
+      endif
     endif
 
     do m=1,nquant
-      mat_tmp=0.d0;mat_tmp(m,m)=1.d0 !! matrix |m><m|
-      mat_tmp2=0.d0
+      !mat_tmp=0.d0;mat_tmp(m,m)=1.d0 !! matrix |m><m|
+      mat_tmp=Q_op(:,:,m)
       do k=0,KK
-!        nvec_plus=nvec;nvec_plus(m,k)=nvec_plus(m,k)+1
-!        call index(nplus,nvec_plus,1)
         nplus=map_nplus(m,k,n)
 
         if(nplus>0.and.nplus<=nn_tot) then
-!if(n==2) write(6,*) "2nd pass",zero(nplus)
-          if(zero(nplus)==0) tmp=tmp - iota*commute(mat_tmp,rho(:,:,nplus))* sqrt((nvec(m,k)+1.d0)*abs(c_matsubara(k)))
-            !mat_tmp2=mat_tmp2+rho(:,:,nplus)! * sqrt((nvec(m,k)+1.d0)*abs(c_matsubara(k)))
+          !! Scaled HEOM approach from JCP 130, 084105 (2009)
+          if(zero(nplus)==0.and.flag_scale==1) tmp=tmp - iota*commute(mat_tmp,rho(:,:,nplus))*&
+          sqrt((nvec(m,k)+1.d0)*abs(c_matsubara(k)))
+          if(zero(nplus)==0.and.flag_scale==0) tmp=tmp - iota*commute(mat_tmp,rho(:,:,nplus))
         endif
       enddo
-      !tmp=tmp - iota*commute(mat_tmp,mat_tmp2)
     enddo
 
     do m=1,nquant
-      mat_tmp=0.d0;mat_tmp(m,m)=1.d0 !! matrix |m><m|
+      !mat_tmp=0.d0;mat_tmp(m,m)=1.d0 !! matrix |m><m|
+      mat_tmp=Q_op(:,:,m)
       do k=0,KK
-!        nvec_neg=nvec;nvec_neg(m,k)=nvec_neg(m,k)-1
-!        call index(nminus,nvec_neg,1)
         nminus=map_nneg(m,k,n)
         if(nminus>0.and.nminus<=nn_tot) then
-!if(n==2) write(6,*) "3rd pass",zero(nplus)
           if(zero(nminus)==0)then
-            tmp=tmp-iota*nvec(m,k)*(c_matsubara(k)*matmul(mat_tmp,rho(:,:,nminus)) &
-- dconjg(c_matsubara(k))*matmul(rho(:,:,nminus),mat_tmp) )*sqrt(nvec(m,k)/c_matsubara(k))
+            !! Scaled HEOM approach from JCP 130, 084105 (2009)
+            if(flag_scale==1)tmp=tmp-iota*(c_matsubara(k)*matmul(mat_tmp,rho(:,:,nminus)) &
+- dconjg(c_matsubara(k))*matmul(rho(:,:,nminus),mat_tmp) )*sqrt(nvec(m,k)/abs(c_matsubara(k)))
+            if(flag_scale==0)tmp=tmp-iota*nvec(m,k)*(c_matsubara(k)*matmul(mat_tmp,rho(:,:,nminus)) &
+- dconjg(c_matsubara(k))*matmul(rho(:,:,nminus),mat_tmp) )
+
           endif
         endif
       enddo
@@ -365,8 +399,6 @@ subroutine index(n,nvec,iflag)
   integer clck_counts_beg,clck_counts_end, clck_rate
   real*8 t1,t2
 
-!  call cpu_time(t1)
-
   if(iflag==0) then  !n is input, nvec is output
     nvec=nn(:,:,n)
   endif
@@ -387,9 +419,6 @@ subroutine index(n,nvec,iflag)
     endif
   endif
         
-!  call cpu_time(t2)
-!  tim_ind=tim_ind+t2-t1
-
 end subroutine index
 !-----------------------------------------------------------------  
 
@@ -453,12 +482,13 @@ subroutine compute_nn
 
   n_tot=0
   n_beg=0;n_end=0
+  write(6,*) "hierarchy level, start index, end index"
   do n=0,LL
     call compute_nn_sum_L(n,n_beg,n_end)
     map_sum(n)=n_beg
-write(6,*) n,n_beg,n_end
+    write(6,*) n,n_beg,n_end
   enddo
-write(6,*) n_end,nn_tot
+  !write(6,*) n_end,nn_tot
 
 end subroutine compute_nn
 !-----------------------------------------------------------------  
@@ -549,8 +579,6 @@ subroutine compute_nn_tot
   enddo
   nn_tot=nint(tmp)
 
-!nn_tot=(factorial(LL+nquant*KK)/factorial(LL))/factorial(nquant*KK)
-
 end subroutine compute_nn_tot
 !-----------------------------------------------------------------  
 
@@ -584,15 +612,32 @@ integer function factorial(n)
 end function factorial
 !-----------------------------------------------------------------  
 
-!subroutine fft_dip_mom_corr
-!  implicit none
-!  integer i,j,k
-!  real*8 w1,tim(nsteps),dat_r(2*nsteps),dat(4*nsteps),tim_doub(2*nsteps)
-!  complex*16 dat_c(nsteps),tmp(3)
-!  real*8,allocatable :: freq(:),dat_fft(:)
-!  integer nst,m_nst,k1,k2
-!  real*8 cos_damp(nsteps),cc,ss,re,im
-!
+subroutine fft_dip_mom_corr
+  implicit none
+  integer i,j,k
+  real*8 w1,tim(nsteps),dat_r(2*nsteps),dat(4*nsteps),tim_doub(2*nsteps)
+  complex*16 dat_c(nsteps),tmp(3)
+  real*8,allocatable :: freq(:),dat_fft(:)
+  integer nst,m_nst,k1,k2
+  real*8 cos_damp(nsteps),cc,ss,re,im
+  real*8 ww(nsteps)
+  complex*16 ft(nsteps)
+
+  ft=0.d0
+  do i=1,nsteps
+    ww(i)=-5.d0+10.d0*i/real(nsteps)
+    tim(i)=(i-1)*dt
+    writE(100,*)tim(i),real(dip_mom_corr(i)),imag(dip_mom_corr(i))
+  enddo
+
+  ft=0.d0
+  do i=1,nsteps
+    do j=1,nsteps
+      ft(i)=ft(i)+exp(iota*ww(i)*tim(j))*dip_mom_corr(j)
+    enddo
+    write(101,*)ww(i),real(ft(i))*dt
+  enddo
+
 !    k=0
 !    do j=1,nsteps
 !      k=k+1
@@ -630,18 +675,18 @@ end function factorial
 !      cc=dcos(freq(j)*tim(nsteps))
 !      ss=-dsin(freq(j)*tim(nsteps))
 !      re=dat_fft(2*j-1);im=dat_fft(2*j)
-!!      write(101,'(4es15.5)')(freq(j)-epsilon)/JJ,re*cc-im*ss,im*cc+re*ss
+!      write(101,'(4es15.5)')freq(j),re,im!re*cc-im*ss,im*cc+re*ss
 !    enddo
 !    do j=1,m_nst/4
 !      cc=dcos(freq(j)*tim(nsteps))
 !      ss=-dsin(freq(j)*tim(nsteps))
 !      re=dat_fft(2*j-1);im=dat_fft(2*j)
-!!      write(101,'(4es15.5)')(freq(j)-epsilon)/JJ,re*cc-im*ss,im*cc+re*ss
+!      write(101,'(4es15.5)')freq(j),re,im!re*cc-im*ss,im*cc+re*ss
 !    enddo
 !    write(101,*)
 !
-!end subroutine fft_dip_mom_corr
-!!-----------------------------------------------------------------  
+end subroutine fft_dip_mom_corr
+!-----------------------------------------------------------------  
 !
 !subroutine fft(t,dat,ndat,w,dat_f,m)
 !  !! computes fft of dat[]
@@ -652,7 +697,8 @@ end function factorial
 !  integer,intent(out)::m
 !  real*8,intent(out),allocatable::w(:),dat_f(:)
 !  real*8 delt
-!  integer i
+!  complex*16 ff,tmp
+!  integer i,j
 !
 !  m=1
 !  do while(m<ndat)
@@ -685,7 +731,17 @@ end function factorial
 !  write(103,*) dat_f(2*i-1),dat_f(2*i)
 !enddo
 !
-!  call fft_gateway(dat_f(:),m)
+!  !call fft_gateway(dat_f(:),m)
+!  dat_f=0.d0
+!  do i=1,m/2
+!    tmp=0.d0
+!    do j=1,ndat/2
+!      ff=dat(2*j-1)+iota*dat(2*j)
+!      tmp=tmp+exp(iota*w(i)*t(j))*ff
+!    enddo
+!    dat_f(2*i-1)=real(tmp)
+!    dat_f(2*i)=imag(tmp)
+!  enddo
 !  dat_f = dat_f*delt
 !
 !end subroutine fft
